@@ -25,15 +25,26 @@ type Host interface {
 // Runtime is the per-session engine driver (Layer 3). Declared here so the
 // session model can hold one; its methods are exercised by prompt handling.
 type Runtime interface {
-	// Submit runs one user turn, streaming events through emit, and returns when
-	// the turn reaches a terminal state. Layer 3 implements this.
-	Submit(ctx context.Context, text string, emit EventSink) error
+	// Submit runs one user turn, streaming events and asking the user through io,
+	// and returns when the turn reaches a terminal state.
+	Submit(ctx context.Context, text string, io *TurnIO) error
 	// Close releases the runtime.
 	Close()
 }
 
 // EventSink streams one live event for a session (message.delta, tool.start, …).
 type EventSink func(eventType string, payload any) error
+
+// AskFunc asks the user one question mid-turn (clarify server-request) and blocks
+// until they answer or the context ends. Returns the answer text; on cancel or
+// error it returns ("", err) and the runtime should proceed without it.
+type AskFunc func(ctx context.Context, question string, choices []string) (string, error)
+
+// TurnIO bundles the streaming sink and the interactive prompt for one turn.
+type TurnIO struct {
+	Emit EventSink
+	Ask  AskFunc
+}
 
 // session is one chat. runtimeID changes per activation; storedID is durable.
 type session struct {
@@ -44,6 +55,40 @@ type session struct {
 	running   bool
 	rt        Runtime
 	mu        sync.Mutex
+
+	nextRowID int64
+	messages  []storedRow // canonical transcript, display chronology
+}
+
+// storedRow is one persisted transcript row (REST history shape).
+type storedRow struct {
+	ID        int64   `json:"id"`
+	SessionID string  `json:"session_id"`
+	Role      string  `json:"role"` // user | assistant
+	Content   string  `json:"content"`
+	Timestamp float64 `json:"timestamp"`
+}
+
+// appendRow records one transcript row and returns its physical id.
+func (s *session) appendRow(role, content string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextRowID++
+	id := s.nextRowID
+	s.messages = append(s.messages, storedRow{
+		ID: id, SessionID: s.storedID, Role: role, Content: content,
+		Timestamp: float64(time.Now().Unix()),
+	})
+	return id
+}
+
+// history returns a shallow copy of the transcript rows.
+func (s *session) history() []storedRow {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]storedRow, len(s.messages))
+	copy(out, s.messages)
+	return out
 }
 
 // gatewayHandler implements Handler for one connection. Sessions are kept on the
@@ -74,12 +119,14 @@ func newSessionRegistry() *sessionRegistry {
 }
 
 // NewHostHandlerFactory returns a factory the gateway Server uses to build one
-// Handler per socket, all sharing one session registry.
-func NewHostHandlerFactory(host Host) func() Handler {
+// Handler per socket, all sharing one session registry, plus the registry itself
+// so the server can serve REST history from the same sessions.
+func NewHostHandlerFactory(host Host) (func() Handler, *sessionRegistry) {
 	reg := newSessionRegistry()
-	return func() Handler {
+	factory := func() Handler {
 		return &gatewayHandler{host: host, sessions: reg, pending: make(map[string]chan serverReply)}
 	}
+	return factory, reg
 }
 
 func (h *gatewayHandler) OnReady(ctx context.Context, c *Conn) { h.conn = c }

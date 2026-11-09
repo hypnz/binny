@@ -28,17 +28,39 @@ func (fakeHost) NewSessionRuntime(Profile) (Runtime, error) { return scriptedRun
 
 type scriptedRuntime struct{}
 
-func (scriptedRuntime) Submit(_ context.Context, text string, emit EventSink) error {
-	_ = emit("message.delta", map[string]any{"text": "analyzing "})
-	_ = emit("message.delta", map[string]any{"text": text})
-	_ = emit("message.complete", map[string]any{"text": "analyzing " + text, "status": "ok"})
+func (scriptedRuntime) Submit(_ context.Context, text string, io *TurnIO) error {
+	_ = io.Emit("message.delta", map[string]any{"text": "analyzing "})
+	_ = io.Emit("message.delta", map[string]any{"text": text})
+	_ = io.Emit("message.complete", map[string]any{"text": "analyzing " + text, "status": "ok"})
 	return nil
 }
 func (scriptedRuntime) Close() {}
 
+// askingRuntime calls Ask once and echoes the answer, to exercise the clarify
+// server-request round-trip.
+type askingRuntime struct{}
+
+func (askingRuntime) Submit(ctx context.Context, _ string, io *TurnIO) error {
+	ans, err := io.Ask(ctx, "Which environment?", []string{"Test", "Production"})
+	if err != nil {
+		return err
+	}
+	_ = io.Emit("message.complete", map[string]any{"text": "using " + ans, "status": "ok"})
+	return nil
+}
+func (askingRuntime) Close() {}
+
+type askingHost struct{}
+
+func (askingHost) Profiles() []Profile {
+	return []Profile{{Name: "demo", Display: "Demo", IsDefault: true, Mode: app.ModeMalware, ProjectID: "p", ProjectNm: "s"}}
+}
+func (askingHost) NewSessionRuntime(Profile) (Runtime, error) { return askingRuntime{}, nil }
+
 func newHostTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	srv := NewServer("test", "tok-xyz", NewHostHandlerFactory(fakeHost{}))
+	factory, reg := NewHostHandlerFactory(fakeHost{})
+	srv := NewServer("test", "tok-xyz", factory, reg)
 	ts := httptest.NewServer(srv.Routes())
 	t.Cleanup(ts.Close)
 	return ts
@@ -166,5 +188,129 @@ func TestSessionCreateThenSubmitStreams(t *testing.T) {
 	}
 	if deltas != "analyzing this binary" {
 		t.Errorf("accumulated deltas = %q, want 'analyzing this binary'", deltas)
+	}
+}
+
+func TestClarifyRoundTrip(t *testing.T) {
+	srv := NewServer("test", "tok-xyz", func() Handler {
+		return &gatewayHandler{host: askingHost{}, sessions: newSessionRegistry(), pending: make(map[string]chan serverReply)}
+	}, newSessionRegistry())
+	ts := httptest.NewServer(srv.Routes())
+	t.Cleanup(ts.Close)
+
+	c, ctx, cancel := dialWS(t, ts)
+	defer cancel()
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	cr := rpc(t, ctx, c, "c1", "session.create", `{"profile":"demo","source":"bighelp","idempotency_key":"k"}`)
+	var created struct{ SessionID string `json:"session_id"` }
+	json.Unmarshal(cr.Result, &created)
+
+	// Submit; the runtime will raise a clarify server-request.
+	rpc(t, ctx, c, "s1", "prompt.submit", `{"session_id":"`+created.SessionID+`","profile":"demo","text":"go","queued":true}`)
+
+	// Expect a clarify server-request; answer it.
+	var clarifyID string
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) && clarifyID == "" {
+		in := readOne(t, ctx, c)
+		if in.Kind == KindServerRequest && in.ReqMethod == "clarify" {
+			clarifyID = in.ReqID
+			var p struct{ Question string `json:"question"` }
+			json.Unmarshal(in.ReqParams, &p)
+			if p.Question != "Which environment?" {
+				t.Errorf("clarify question = %q", p.Question)
+			}
+		}
+	}
+	if clarifyID == "" {
+		t.Fatal("no clarify server-request arrived")
+	}
+	// Reply with the answer (same id, result envelope).
+	writeReq(t, ctx, c, `{"jsonrpc":"2.0","id":"`+clarifyID+`","result":{"answer":"Test"}}`)
+
+	// The runtime should complete using the answer.
+	var done bool
+	deadline = time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) && !done {
+		in := readOne(t, ctx, c)
+		if in.Kind == KindEvent && in.EventType == "message.complete" {
+			var p struct{ Text string `json:"text"` }
+			json.Unmarshal(in.Payload, &p)
+			if p.Text != "using Test" {
+				t.Errorf("complete text = %q, want 'using Test'", p.Text)
+			}
+			done = true
+		}
+	}
+	if !done {
+		t.Fatal("turn did not complete after clarify answer")
+	}
+}
+
+func TestHistoryRESTAfterTurn(t *testing.T) {
+	ts := newHostTestServer(t)
+	c, ctx, cancel := dialWS(t, ts)
+	defer cancel()
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	cr := rpc(t, ctx, c, "c1", "session.create", `{"profile":"demo","source":"bighelp","idempotency_key":"k"}`)
+	var created struct {
+		SessionID string `json:"session_id"`
+		StoredID  string `json:"stored_session_id"`
+	}
+	json.Unmarshal(cr.Result, &created)
+
+	rpc(t, ctx, c, "s1", "prompt.submit", `{"session_id":"`+created.SessionID+`","profile":"demo","text":"the file","queued":true}`)
+	// Wait for terminal.
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		in := readOne(t, ctx, c)
+		if in.Kind == KindEvent && in.EventType == "session.info" {
+			var p struct{ Running *bool `json:"running"` }
+			json.Unmarshal(in.Payload, &p)
+			if p.Running != nil && !*p.Running {
+				break
+			}
+		}
+	}
+
+	// GET /api/sessions
+	req, _ := http.NewRequest("GET", ts.URL+"/api/sessions?profile=demo", nil)
+	req.Header.Set("X-Hermes-Session-Token", "tok-xyz")
+	resp, _ := http.DefaultClient.Do(req)
+	var sl struct {
+		Sessions []struct {
+			StoredID     string `json:"stored_session_id"`
+			MessageCount int    `json:"message_count"`
+		} `json:"sessions"`
+	}
+	json.NewDecoder(resp.Body).Decode(&sl)
+	if len(sl.Sessions) != 1 || sl.Sessions[0].MessageCount != 2 {
+		t.Fatalf("sessions list = %+v (want 1 session, 2 messages)", sl.Sessions)
+	}
+
+	// GET /api/sessions/{id}/messages
+	req2, _ := http.NewRequest("GET", ts.URL+"/api/sessions/"+created.StoredID+"/messages?profile=demo&order=oldest&limit=40", nil)
+	req2.Header.Set("X-Hermes-Session-Token", "tok-xyz")
+	resp2, _ := http.DefaultClient.Do(req2)
+	var hm struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+		Pagination struct {
+			Returned int `json:"returned"`
+		} `json:"pagination"`
+	}
+	json.NewDecoder(resp2.Body).Decode(&hm)
+	if len(hm.Messages) != 2 || hm.Pagination.Returned != 2 {
+		t.Fatalf("messages = %+v", hm)
+	}
+	if hm.Messages[0].Role != "user" || hm.Messages[0].Content != "the file" {
+		t.Errorf("row0 = %+v, want user 'the file'", hm.Messages[0])
+	}
+	if hm.Messages[1].Role != "assistant" || hm.Messages[1].Content != "analyzing the file" {
+		t.Errorf("row1 = %+v, want assistant 'analyzing the file'", hm.Messages[1])
 	}
 }

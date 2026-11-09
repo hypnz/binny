@@ -103,7 +103,8 @@ Flags:
 		projByProfile: indexProjects(profiles),
 	}
 
-	srv := gateway.NewServer(version, strings.TrimSpace(*token), gateway.NewHostHandlerFactory(host))
+	factory, sessReg := gateway.NewHostHandlerFactory(host)
+	srv := gateway.NewServer(version, strings.TrimSpace(*token), factory, sessReg)
 
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
@@ -186,8 +187,11 @@ func (h *bighelpHost) NewSessionRuntime(profile gateway.Profile) (gateway.Runtim
 // callback types are structurally identical; this adapts the one to the other.
 type runtimeAdapter struct{ rt *agent.GatewayRuntime }
 
-func (a *runtimeAdapter) Submit(ctx context.Context, text string, emit gateway.EventSink) error {
-	return a.rt.Submit(ctx, text, func(t string, p any) error { return emit(t, p) })
+func (a *runtimeAdapter) Submit(ctx context.Context, text string, io *gateway.TurnIO) error {
+	return a.rt.Submit(ctx, text, &agent.TurnIO{
+		Emit: func(t string, p any) error { return io.Emit(t, p) },
+		Ask:  func(c context.Context, q string, ch []string) (string, error) { return io.Ask(c, q, ch) },
+	})
 }
 func (a *runtimeAdapter) Close() { a.rt.Close() }
 

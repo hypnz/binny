@@ -3,7 +3,47 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 )
+
+// askUser raises a clarify server-request to the connected client and blocks
+// until the client replies ({answer:"..."}) or the context ends. The clarify
+// wire shape is {session_id, question, choices?, multi_select:false}; the reply
+// is {answer:string} (or {} for cancel).
+func (h *gatewayHandler) askUser(ctx context.Context, runtimeID, question string, choices []string) (string, error) {
+	id := newID("srv")
+	ch := make(chan serverReply, 1)
+	h.pendingMu.Lock()
+	h.pending[id] = ch
+	h.pendingMu.Unlock()
+	defer func() {
+		h.pendingMu.Lock()
+		delete(h.pending, id)
+		h.pendingMu.Unlock()
+	}()
+
+	params := map[string]any{"session_id": runtimeID, "question": question, "multi_select": false}
+	if len(choices) > 0 {
+		params["choices"] = choices
+	}
+	if err := h.conn.SendServerRequest(context.Background(), id, "clarify", params); err != nil {
+		return "", err
+	}
+
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case rep := <-ch:
+		if rep.err != nil {
+			return "", fmt.Errorf("clarify declined: %s", rep.err.Message)
+		}
+		var r struct {
+			Answer string `json:"answer"`
+		}
+		_ = json.Unmarshal(rep.result, &r)
+		return r.Answer, nil // empty answer == cancel ({}), handled by caller
+	}
+}
 
 // promptMethod handles prompt.submit / steer / queue / interrupt. Layer 3 wires
 // these to a binny Engine and streams live events; until then it admits the turn
@@ -43,11 +83,14 @@ func (h *gatewayHandler) submit(ctx context.Context, params json.RawMessage) (an
 		return nil, &MethodError{Code: ErrInvalidParams, Message: "empty prompt text"}
 	}
 
-	// Layer 3 builds the runtime lazily and streams the turn. For now, admit the
-	// turn (status:streaming) and run it through the Runtime if the host built
-	// one; otherwise report pending so the wire contract is still honored.
+	// Admit the turn (status:streaming) and run it through the Runtime. emit
+	// streams live events bound to this session's runtime id; ask raises a
+	// clarify server-request and blocks for the user's answer.
 	emit := func(eventType string, payload any) error {
-		return h.conn.Emit(ctx, eventType, payload, s.runtimeID, nil)
+		return h.conn.Emit(context.Background(), eventType, payload, s.runtimeID, nil)
+	}
+	ask := func(qctx context.Context, question string, choices []string) (string, error) {
+		return h.askUser(qctx, s.runtimeID, question, choices)
 	}
 
 	s.mu.Lock()
@@ -68,18 +111,49 @@ func (h *gatewayHandler) submit(ctx context.Context, params json.RawMessage) (an
 		return nil, &MethodError{Code: ErrInternal, Message: "agent runtime unavailable on this host"}
 	}
 
+	// Record the user row now (admission); capture the assistant's final text for
+	// the transcript by wrapping emit.
+	userRowID := s.appendRow("user", p.Text)
+	var assistantText string
+	recEmit := func(eventType string, payload any) error {
+		switch eventType {
+		case "message.delta":
+			if m, ok := payload.(map[string]any); ok {
+				if t, ok := m["text"].(string); ok {
+					assistantText += t
+				}
+			}
+		case "message.interim":
+			if m, ok := payload.(map[string]any); ok {
+				if t, ok := m["text"].(string); ok {
+					assistantText += t
+				}
+			}
+		case "message.complete":
+			if m, ok := payload.(map[string]any); ok {
+				if t, ok := m["text"].(string); ok && t != "" {
+					assistantText = t // final replaces accumulated deltas
+				}
+			}
+		}
+		return emit(eventType, payload)
+	}
+
 	// Run the turn asynchronously so the admission receipt returns immediately
 	// (status:streaming), then live events stream until terminal.
 	s.mu.Lock()
 	s.running = true
 	s.mu.Unlock()
 	go func() {
-		_ = emit("message.start", map[string]any{})
-		err := rt.Submit(context.Background(), p.Text, emit)
+		_ = recEmit("message.start", map[string]any{})
+		err := rt.Submit(context.Background(), p.Text, &TurnIO{Emit: recEmit, Ask: ask})
 		if err != nil {
-			_ = emit("message.complete", map[string]any{
+			_ = recEmit("message.complete", map[string]any{
 				"status": "error", "text": err.Error(),
 			})
+		}
+		if assistantText != "" {
+			s.appendRow("assistant", assistantText)
 		}
 		s.mu.Lock()
 		s.running = false
@@ -88,5 +162,5 @@ func (h *gatewayHandler) submit(ctx context.Context, params json.RawMessage) (an
 		_ = emit("session.info", map[string]any{"running": false})
 	}()
 
-	return map[string]any{"status": "streaming"}, nil
+	return map[string]any{"status": "streaming", "user_row_id": userRowID}, nil
 }

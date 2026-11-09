@@ -35,7 +35,7 @@ func (h *echoHandler) OnClientReply(string, json.RawMessage, *WireError) {}
 
 func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 	t.Helper()
-	srv := NewServer("test", "tok-123", func() Handler { return &echoHandler{} })
+	srv := NewServer("test", "tok-123", func() Handler { return &echoHandler{} }, newSessionRegistry())
 	ts := httptest.NewServer(srv.Routes())
 	t.Cleanup(ts.Close)
 	return srv, ts

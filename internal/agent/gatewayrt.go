@@ -27,6 +27,17 @@ import (
 // doesn't abort the turn).
 type EventEmit func(eventType string, payload any) error
 
+// AskUser asks the person one question mid-turn and blocks for their answer. The
+// gateway maps it to a clarify server-request. An empty answer or error means
+// "no answer" and the engine proceeds on best judgment.
+type AskUser func(ctx context.Context, question string, choices []string) (string, error)
+
+// TurnIO is the per-turn I/O the gateway hands the runtime.
+type TurnIO struct {
+	Emit EventEmit
+	Ask  AskUser
+}
+
 // GatewayRuntime drives one chat session's engine across turns. The engine and
 // investigation persist for the life of the session, so phase progression and
 // gathered evidence carry across messages, exactly as in an interactive run.
@@ -56,7 +67,8 @@ func (r *GatewayRuntime) Model() string { return r.eng.Model() }
 // The first turn seeds the loop (triage kickoff); later turns append the user's
 // message and continue. It runs the engine autonomously within the turn: no
 // interactive checkpoints (the phone drives turn-by-turn, not phase-by-phase).
-func (r *GatewayRuntime) Submit(ctx context.Context, text string, emit EventEmit) error {
+func (r *GatewayRuntime) Submit(ctx context.Context, text string, io *TurnIO) error {
+	emit := io.Emit
 	// Token-level assistant text streams as message.delta via the engine's sink.
 	r.eng.SetStreamSink(func(s string) {
 		_ = emit("message.delta", map[string]any{"text": s})
@@ -100,11 +112,20 @@ func (r *GatewayRuntime) Submit(ctx context.Context, text string, emit EventEmit
 			// isn't left with a half-finished answer.
 			emitLines(emit, r.eng.ContinuePastCap())
 		case res.AwaitQuestion != "":
-			// The engine wants input. Phase 4 maps this to a clarify server-
-			// request; for now, surface it as assistant text and end the turn so
-			// the user can answer with their next message.
-			_ = emit("message.complete", map[string]any{"text": res.AwaitQuestion})
-			return nil
+			// The engine wants input — ask the user via a clarify server-request
+			// and feed their answer straight back, so the turn continues instead
+			// of stalling. If they cancel or asking isn't possible, proceed on
+			// best judgment so an unattended turn still terminates.
+			answer := ""
+			if io.Ask != nil {
+				if a, err := io.Ask(ctx, res.AwaitQuestion, nil); err == nil {
+					answer = a
+				}
+			}
+			if answer == "" {
+				answer = "Proceed using your best judgment; note any assumption in the report."
+			}
+			r.eng.Provide(answer)
 		}
 
 		// Once synthesis hands off to REVIEW the draft is ready; end the turn.

@@ -23,20 +23,23 @@ import (
 // HandlerFactory builds one Handler per accepted socket, so each connection gets
 // its own owner/epoch scope.
 type Server struct {
-	version        string
-	sessionToken   string // the ungated "dashboard" token
-	newHandler     func() Handler
-	epochCounter   atomic.Uint64
+	version      string
+	sessionToken string // the ungated "dashboard" token
+	newHandler   func() Handler
+	sessions     *sessionRegistry // shared with the handlers, for REST history
+	epochCounter atomic.Uint64
 }
 
 // NewServer builds a gateway. If sessionToken is empty, a random one is minted;
 // in ungated mode the token is handed to the client via GET / so a known value
 // isn't required, but a stable one across restarts keeps existing clients valid.
-func NewServer(version, sessionToken string, newHandler func() Handler) *Server {
+// Pass the registry returned alongside the handler factory so REST history reads
+// the same sessions the socket writes.
+func NewServer(version, sessionToken string, newHandler func() Handler, sessions *sessionRegistry) *Server {
 	if sessionToken == "" {
 		sessionToken = randomToken()
 	}
-	return &Server{version: version, sessionToken: sessionToken, newHandler: newHandler}
+	return &Server{version: version, sessionToken: sessionToken, newHandler: newHandler, sessions: sessions}
 }
 
 // Token is the ungated session token this server accepts.
@@ -49,7 +52,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/ws", s.handleWS)
-	mux.HandleFunc("/", s.handleRoot) // ungated bootstrap page (GET /)
+	mux.HandleFunc("/api/sessions", s.handleSessions)         // saved chat list
+	mux.HandleFunc("/api/sessions/", s.handleSessionMessages) // /{id}/messages
+	mux.HandleFunc("/", s.handleRoot)                         // ungated bootstrap page (GET /)
 	return mux
 }
 
