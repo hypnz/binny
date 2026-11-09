@@ -34,18 +34,28 @@ jobs:
   package:
     name: Package ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # mac may fail to acquire a hosted runner (GitHub capacity); optional:false
+    # on it keeps the overall run from being blocked by a mac-only hiccup, while
+    # Windows and Linux remain required.
+    continue-on-error: ${{ matrix.optional }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest, ubuntu-latest]
+        include:
+          - os: macos-13       # Intel runner — more available than macos-latest arm64
+            optional: true
+          - os: windows-latest
+            optional: false
+          - os: ubuntu-latest
+            optional: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Resolve version from tag
         id: ver
