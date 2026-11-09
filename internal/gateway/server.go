@@ -27,6 +27,7 @@ type Server struct {
 	sessionToken string // the ungated "dashboard" token
 	newHandler   func() Handler
 	sessions     *sessionRegistry // shared with the handlers, for REST history
+	bootID       string           // stable per-process id for plugin runtimeId
 	epochCounter atomic.Uint64
 }
 
@@ -39,7 +40,7 @@ func NewServer(version, sessionToken string, newHandler func() Handler, sessions
 	if sessionToken == "" {
 		sessionToken = randomToken()
 	}
-	return &Server{version: version, sessionToken: sessionToken, newHandler: newHandler, sessions: sessions}
+	return &Server{version: version, sessionToken: sessionToken, newHandler: newHandler, sessions: sessions, bootID: randomToken()[:16]}
 }
 
 // Token is the ungated session token this server accepts.
@@ -54,7 +55,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/api/ws", s.handleWS)
 	mux.HandleFunc("/api/sessions", s.handleSessions)         // saved chat list
 	mux.HandleFunc("/api/sessions/", s.handleSessionMessages) // /{id}/messages
-	mux.HandleFunc("/", s.handleRoot)                         // ungated bootstrap page (GET /)
+	mux.HandleFunc("/api/plugins/"+pluginWireName+"/native/context", s.handlePluginContext)
+	mux.HandleFunc("/", s.handleRoot) // ungated bootstrap page (GET /)
 	return mux
 }
 

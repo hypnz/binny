@@ -314,3 +314,45 @@ func TestHistoryRESTAfterTurn(t *testing.T) {
 		t.Errorf("row1 = %+v, want assistant 'analyzing the file'", hm.Messages[1])
 	}
 }
+
+func TestPluginNativeContext(t *testing.T) {
+	ts := newHostTestServer(t)
+	req, _ := http.NewRequest("GET", ts.URL+"/api/plugins/loopdy/native/context", nil)
+	req.Header.Set("X-Hermes-Session-Token", "tok-xyz")
+	req.Header.Set("Accept", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", cc)
+	}
+	etag := resp.Header.Get("ETag")
+	if !strings.HasPrefix(etag, `"sha256:`) || !strings.HasSuffix(etag, `"`) || len(etag) != len(`"sha256:`)+64+1 {
+		t.Errorf("ETag = %q, want quoted sha256:<64 hex>", etag)
+	}
+	var ctx struct {
+		SchemaVersion int      `json:"schemaVersion"`
+		Features      []string `json:"features"`
+		Principal     any      `json:"principal"`
+	}
+	json.NewDecoder(resp.Body).Decode(&ctx)
+	if ctx.SchemaVersion != 1 {
+		t.Errorf("schemaVersion = %d, want 1", ctx.SchemaVersion)
+	}
+	if ctx.Principal != nil {
+		t.Errorf("principal = %v, want null for dashboard-session auth", ctx.Principal)
+	}
+	found := false
+	for _, f := range ctx.Features {
+		if f == "native-context-v1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("features %v missing required native-context-v1", ctx.Features)
+	}
+}
