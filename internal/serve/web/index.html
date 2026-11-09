@@ -228,6 +228,24 @@
       <div class="menu-note" id="compactNote">Summarize the conversation to free up the window.</div>
     </div>
   </div>
+  <div class="focus" id="mobile">
+    <button id="mobileBtn" type="button" title="Share binny to the bighelp phone app">Mobile</button>
+    <div class="focus-menu menu1" id="mobileMenu" hidden>
+      <div class="menu-note" id="mobStatus">Checking…</div>
+      <label class="fld">Default lens
+        <select id="mobMode"><option value="malware">Malware</option><option value="vuln">Vuln</option></select>
+      </label>
+      <label class="fld">Port<input id="mobPort" type="number" min="1" max="65535" step="1" value="8787"></label>
+      <button id="mobStart" class="menu-btn" type="button">Start sharing to phone</button>
+      <button id="mobStop" class="menu-btn" type="button" style="display:none">Stop sharing</button>
+      <div id="mobConn" style="display:none">
+        <div class="menu-note">In bighelp: Settings › System › Computers › Add a computer</div>
+        <label class="fld">Address<input id="mobAddr" type="text" readonly></label>
+        <label class="fld">Token<input id="mobToken" type="text" readonly></label>
+        <button id="mobQR" class="menu-btn" type="button">Open connection page (QR)</button>
+      </div>
+    </div>
+  </div>
   <button id="cloudBtn" title="Sign in and open one of your cloud projects">Cloud</button>
   <button id="openApk" title="Analyze a local file — a binary (.exe/.elf/Mach-O) or an APK">Open</button>
   <input type="file" id="apkInput" style="display:none">
@@ -447,6 +465,47 @@ function addArtifact(a){
 /* ---- settings + compact ---- */
 $("#settingsBtn").onclick = e=>{ e.stopPropagation(); const m=$("#settingsMenu"); m.hidden=!m.hidden; };
 document.addEventListener("click", e=>{ if(!$("#settings").contains(e.target)) $("#settingsMenu").hidden=true; });
+
+// --- Mobile (bighelp) sharing panel ---
+async function mobApi(method, path, body){
+  const r = await fetch(path, { method, headers:{"Content-Type":"application/json"}, body: body?JSON.stringify(body):undefined });
+  let j=null; try{ j=await r.json(); }catch(_){}
+  return { ok:r.ok, status:r.status, json:j };
+}
+function renderMobile(st, available, reason){
+  const note=$("#mobStatus"), conn=$("#mobConn"), start=$("#mobStart"), stop=$("#mobStop");
+  if(!available){ note.textContent = "Unavailable: "+(reason||"unknown"); start.style.display="none"; stop.style.display="none"; conn.style.display="none"; return; }
+  const running = st && st.running;
+  note.textContent = running ? "Sharing is ON" : "Sharing is off";
+  start.style.display = running?"none":"block";
+  stop.style.display  = running?"block":"none";
+  conn.style.display  = running?"block":"none";
+  if(running){
+    const urls = st.connect_urls||[];
+    $("#mobAddr").value = urls[0]||st.addr||"";
+    $("#mobToken").value = st.token||"";
+  }
+}
+async function refreshMobile(){
+  const r = await mobApi("GET","/api/bighelp/status");
+  if(r.json && r.json.available===false){ renderMobile(null,false,r.json.reason); return; }
+  renderMobile(r.json && r.json.status, true);
+}
+$("#mobileBtn").onclick = e=>{ e.stopPropagation(); const m=$("#mobileMenu"); m.hidden=!m.hidden; if(!m.hidden) refreshMobile(); };
+document.addEventListener("click", e=>{ if(!$("#mobile").contains(e.target)) $("#mobileMenu").hidden=true; });
+$("#mobStart").onclick = async ()=>{
+  $("#mobStatus").textContent="Starting…";
+  const port=parseInt($("#mobPort").value,10)||8787;
+  const r = await mobApi("POST","/api/bighelp/start",{ addr:"0.0.0.0:"+port, mode:$("#mobMode").value });
+  if(!r.ok){ $("#mobStatus").textContent = "Error: "+((r.json&&r.json.error)||r.status); return; }
+  renderMobile(r.json.status, true);
+};
+$("#mobStop").onclick = async ()=>{
+  $("#mobStatus").textContent="Stopping…";
+  const r = await mobApi("POST","/api/bighelp/stop");
+  renderMobile(r.json && r.json.status, true);
+};
+$("#mobQR").onclick = ()=>{ window.open("/api/bighelp/connect","_blank","width=440,height=680"); };
 $("#setMaxTok").onchange = e=>{ const v=parseInt(e.target.value,10); if(v>0) state.maxTokens=v; };
 $("#setBudget").onchange = e=>{ const v=parseInt(e.target.value,10); if(v>0){ state.budget=v; updateMeter(); } };
 function setCompactNote(t){ $("#compactNote").textContent=t; }

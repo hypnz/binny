@@ -24,7 +24,8 @@ import (
 	"openbin.ai/binny/internal/store"
 )
 
-// ProfileSpec selects one project to serve as a bighelp profile.
+// ProfileSpec selects one project to serve as a bighelp profile. Still used by
+// the CLI for an explicit --project; Desktop auto-enumerates instead.
 type ProfileSpec struct {
 	ProjectRef string   // backend id, local:<sha>, or a local sha
 	Mode       app.Mode // MALWARE | VULN_RESEARCH
@@ -37,6 +38,39 @@ type Config struct {
 	Cfg       *config.Config
 	Client    *api.Client
 	Version   string
+}
+
+// AllProjectSpecs enumerates every project binny knows — the account's backend
+// projects (if signed in) and every local decompile on disk — as specs in the
+// given mode. This is how Desktop shares "all projects" without the user picking.
+// Backend-list failures (offline / not signed in) are non-fatal: local projects
+// still come through.
+func AllProjectSpecs(client *api.Client, mode app.Mode) []ProfileSpec {
+	var specs []ProfileSpec
+	seen := map[string]bool{}
+
+	// Local decompiles first (always available, no network).
+	for _, m := range store.List() {
+		id := store.LocalID(m.Sha256)
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		specs = append(specs, ProfileSpec{ProjectRef: id, Mode: mode})
+	}
+	// Backend projects, best-effort.
+	if client != nil {
+		if projects, err := client.ListProjects(); err == nil {
+			for _, p := range projects {
+				if seen[p.ID] {
+					continue
+				}
+				seen[p.ID] = true
+				specs = append(specs, ProfileSpec{ProjectRef: p.ID, Mode: mode})
+			}
+		}
+	}
+	return specs
 }
 
 // Host implements gateway.Host: it maps each profile to a binny project+mode and
@@ -182,6 +216,16 @@ func (c *Controller) Start(addr, token string, specs []ProfileSpec) (Status, err
 		_ = c.httpSrv.Serve(ln)
 	}()
 	return c.statusLocked(), nil
+}
+
+// StartAll starts the gateway sharing EVERY binny project (backend + local) as a
+// profile, in the given mode. This is the Desktop path: no per-project selection.
+func (c *Controller) StartAll(addr, token string, mode app.Mode) (Status, error) {
+	specs := AllProjectSpecs(c.cfg.Client, mode)
+	if len(specs) == 0 {
+		return Status{}, fmt.Errorf("no projects to share — open or decompile one first")
+	}
+	return c.Start(addr, token, specs)
 }
 
 // Stop shuts the gateway down. Safe to call when already stopped.

@@ -130,18 +130,10 @@ async function startSharing() {
       dialog.showErrorBox('BINNY Mobile', 'Mobile sharing is unavailable: ' + (st.json.reason || 'unknown'));
       return;
     }
-    // Share whatever project Desktop currently has open. The user can refine
-    // selection from the connection page; this makes the common case one click.
-    const proj = await currentProjectRef();
-    if (!proj) {
-      dialog.showMessageBox(win, { type: 'info', title: 'BINNY Mobile',
-        message: 'Open or decompile a project first, then start mobile sharing.' });
-      return;
-    }
-    const resp = await apiRequest('POST', '/api/bighelp/start', {
-      addr: '0.0.0.0:8787',
-      projects: [{ ref: proj.ref, mode: 'malware', sample: '' }],
-    });
+    // Every binny project is shared automatically — no selection. Default lens
+    // is malware; switch per-chat on the phone or from the web panel's Mobile
+    // controls.
+    const resp = await apiRequest('POST', '/api/bighelp/start', { addr: '0.0.0.0:8787', mode: 'malware' });
     if (resp.status !== 200) {
       dialog.showErrorBox('BINNY Mobile', 'Could not start sharing: ' + ((resp.json && resp.json.error) || resp.status));
       return;
@@ -164,16 +156,6 @@ async function sharingRunning() {
     const st = await apiRequest('GET', '/api/bighelp/status');
     return !!(st.json && st.json.status && st.json.status.running);
   } catch (_) { return false; }
-}
-
-// currentProjectRef asks the backend what project is open (id or local tree).
-async function currentProjectRef() {
-  try {
-    const cfgResp = await apiRequest('GET', '/api/config');
-    const pid = cfgResp.json && cfgResp.json.projectId;
-    if (pid) return { ref: pid };
-  } catch (_) {}
-  return null;
 }
 
 async function openFolder() {

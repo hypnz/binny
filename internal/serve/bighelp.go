@@ -56,14 +56,13 @@ func (s *server) handleBighelpStatus(w http.ResponseWriter, r *http.Request) {
 	writeServeJSON(w, http.StatusOK, map[string]any{"available": true, "status": st})
 }
 
+// bighelpStartReq configures a sharing session. There is no project selection:
+// every binny project (backend + local) is shared automatically. The caller
+// chooses the analysis lens (mode), bind address and an optional fixed token.
 type bighelpStartReq struct {
-	Addr     string `json:"addr"`     // e.g. "0.0.0.0:8787" or ":8787"
-	Token    string `json:"token"`    // optional fixed token
-	Projects []struct {
-		Ref    string `json:"ref"`     // project id / local:<sha> / sha
-		Mode   string `json:"mode"`    // "malware" | "vuln"
-		Sample string `json:"sample"`  // optional raw sample path
-	} `json:"projects"`
+	Addr  string `json:"addr"`  // e.g. "0.0.0.0:8787" or ":8787"
+	Token string `json:"token"` // optional fixed token
+	Mode  string `json:"mode"`  // "malware" | "vuln" — default lens for every project
 }
 
 func (s *server) handleBighelpStart(w http.ResponseWriter, r *http.Request) {
@@ -77,27 +76,18 @@ func (s *server) handleBighelpStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req bighelpStartReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeServeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad request body"})
-		return
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req) // body optional; all fields have defaults
 	}
-	if len(req.Projects) == 0 {
-		writeServeJSON(w, http.StatusBadRequest, map[string]any{"error": "select at least one project to share"})
-		return
-	}
-	var specs []gwhost.ProfileSpec
-	for _, p := range req.Projects {
-		mode := app.ModeMalware
-		if strings.EqualFold(p.Mode, "vuln") || strings.EqualFold(p.Mode, "vuln_research") {
-			mode = app.ModeVuln
-		}
-		specs = append(specs, gwhost.ProfileSpec{ProjectRef: p.Ref, Mode: mode, Sample: p.Sample})
+	mode := app.ModeMalware
+	if strings.EqualFold(req.Mode, "vuln") || strings.EqualFold(req.Mode, "vuln_research") {
+		mode = app.ModeVuln
 	}
 	addr := strings.TrimSpace(req.Addr)
 	if addr == "" {
 		addr = "0.0.0.0:8787" // default to shareable; the page shows the real IPs
 	}
-	st, err := ctrl.Start(addr, req.Token, specs)
+	st, err := ctrl.StartAll(addr, req.Token, mode)
 	if err != nil {
 		writeServeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "status": st})
 		return
