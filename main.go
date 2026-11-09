@@ -57,6 +57,9 @@ func run() error {
 	if len(os.Args) > 1 && os.Args[1] == "desktop" {
 		return runDesktop(os.Args[2:])
 	}
+	if len(os.Args) > 1 && os.Args[1] == "bighelp" {
+		return runBighelp(os.Args[2:])
+	}
 	flag.Usage = usage
 	// --sample points BINNY at the raw sample on disk for active extraction.
 	// The bytes never leave the machine — that's why extraction fits a local
