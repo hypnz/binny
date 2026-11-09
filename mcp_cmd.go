@@ -5,11 +5,18 @@ package main
 // client) can drive them against one project. The host's model is the analyst;
 // BINNY supplies the tools and the project they read.
 //
-// Phase 1 scope: the READ toolset (list_functions, get_function, get_strings,
-// get_imports, xrefs, reachability, decompiled-source reads, manifest/code
-// search for APKs). The local-decompile and sandbox `run` tools — which need
-// Docker on the host — and BINNY's own investigate/report loop are deliberately
-// out of scope here; see the integration notes.
+// Served tools:
+//
+//   - Always: the READ toolset (list_functions, get_function, get_strings,
+//     get_imports, xrefs, reachability, decompiled-source reads, manifest/code
+//     search for APKs).
+//   - With --sample and Docker on the host: the active-extraction sandbox
+//     (write_file, run, read_artifact — a hardened, networkless container with
+//     the sample read-only at /sample) and, for BIN projects, decompile_sample
+//     (local Ghidra headless, hot-swapped into the read tools).
+//
+// BINNY's own investigate/report loop stays out of scope — the host's model
+// drives its own loop and just calls these tools.
 
 import (
 	"context"
@@ -19,10 +26,13 @@ import (
 	"os/signal"
 	"strings"
 
+	"openbin.ai/binny/internal/agent"
 	"openbin.ai/binny/internal/api"
+	"openbin.ai/binny/internal/app"
 	"openbin.ai/binny/internal/auth"
 	"openbin.ai/binny/internal/config"
 	"openbin.ai/binny/internal/mcp"
+	"openbin.ai/binny/internal/sandbox"
 	"openbin.ai/binny/internal/store"
 	"openbin.ai/binny/internal/tools"
 )
@@ -32,6 +42,9 @@ func runMCP(args []string) error {
 	fs := flag.NewFlagSet("binny mcp", flag.ContinueOnError)
 	project := fs.String("project", "", "project to serve: a backend project id, a local id (local:<sha>), or the sha of a local decompile")
 	list := fs.Bool("list", false, "list projects reachable with the current sign-in and exit")
+	samplePath := fs.String("sample", "", "path to the raw sample on disk; enables the sandbox tools (run/write_file/read_artifact) and decompile_sample (needs Docker)")
+	workspacePath := fs.String("workspace", "", "persistent host dir mounted rw at /work in the sandbox (default: per-sample dir under the binny store)")
+	noDocker := fs.Bool("no-docker", false, "never register the Docker-backed tools, even with --sample (read-only server)")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), `Usage: binny mcp --project <id> [flags]
 
@@ -44,12 +57,17 @@ and its model drives the tools; diagnostics go to stderr, never stdout.
   binny mcp --project local:<sha12>    serve a locally decompiled project
   binny mcp --project <sha>            same, by the sample's sha
 
+  binny mcp --project <id> --sample ./malware.bin
+                                       also serve the sandbox + decompile tools
+
 Backend projects need 'openbin login'. Local projects come from 'binny'/'binny
-desktop' '/decompile' and are read from disk.
+desktop' '/decompile' and are read from disk. The sandbox and decompile_sample
+tools need Docker on this host and a --sample path (the raw file); without
+either, only the read tools are served.
 
 Register it on a Hermes profile as a stdio MCP server, e.g.:
   command: binny
-  args:    ["mcp", "--project", "local:abc123def456"]
+  args:    ["mcp", "--project", "local:abc123def456", "--sample", "/path/malware.bin"]
 
 Flags:
 `)
@@ -63,6 +81,10 @@ Flags:
 	}
 
 	ep := config.LoadEndpoints()
+	cfg, _, err := config.Load()
+	if err != nil {
+		return err
+	}
 	toks, err := auth.NewTokenSource(ep)
 	if err != nil {
 		return fmt.Errorf("auth: %w (run 'openbin login' first for backend projects)", err)
@@ -91,6 +113,45 @@ Flags:
 		fmt.Fprintf(os.Stderr, "binny: "+format+"\n", args...)
 	}
 	tb.RegisterRead(reg)
+
+	// Docker-backed tools (opt-in via --sample, unless --no-docker). They read
+	// the sample/workspace from a session struct at call time. The sandbox tools
+	// work for any kind; decompile_sample is BIN-only (it hot-swaps a native
+	// analysis the read tools serve — APK/script projects have none).
+	sample := strings.TrimSpace(*samplePath)
+	switch {
+	case *noDocker:
+		if sample != "" {
+			fmt.Fprintln(os.Stderr, "binny mcp: --no-docker set — serving read tools only, ignoring --sample")
+		}
+	case sample == "":
+		fmt.Fprintln(os.Stderr, "binny mcp: no --sample — serving read tools only (pass --sample <raw file> for sandbox/decompile)")
+	default:
+		if _, err := os.Stat(sample); err != nil {
+			return fmt.Errorf("--sample %q: %w", sample, err)
+		}
+		if err := sandbox.EnsureImage(context.Background()); err != nil {
+			// Don't abort: a host without the image can still use the read
+			// tools. Say so clearly and keep the sandbox tools out.
+			fmt.Fprintf(os.Stderr, "binny mcp: sandbox image unavailable (%v) — serving read tools only\n", err)
+			break
+		}
+		sess := &app.Session{
+			Endpoints:     ep,
+			Config:        cfg,
+			API:           client,
+			Project:       proj,
+			SamplePath:    sample,
+			WorkspacePath: strings.TrimSpace(*workspacePath),
+		}
+		agent.RegisterSandboxTools(reg, sess)
+		if proj.Kind == api.KindBIN {
+			agent.RegisterDecompileTool(reg, sess, tb, func(format string, args ...any) {
+				fmt.Fprintf(os.Stderr, "binny decompile: "+format+"\n", args...)
+			})
+		}
+		fmt.Fprintf(os.Stderr, "binny mcp: Docker tools enabled (sample %s)\n", sample)
+	}
 
 	srv := mcp.NewServer(reg, version)
 	srv.Logf = func(format string, args ...any) {
