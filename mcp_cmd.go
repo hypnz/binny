@@ -45,6 +45,9 @@ func runMCP(args []string) error {
 	samplePath := fs.String("sample", "", "path to the raw sample on disk; enables the sandbox tools (run/write_file/read_artifact) and decompile_sample (needs Docker)")
 	workspacePath := fs.String("workspace", "", "persistent host dir mounted rw at /work in the sandbox (default: per-sample dir under the binny store)")
 	noDocker := fs.Bool("no-docker", false, "never register the Docker-backed tools, even with --sample (read-only server)")
+	agentTool := fs.Bool("agent", false, "also expose an 'investigate' tool that runs BINNY's full triage→investigate→report loop (needs a configured LLM provider / BYOK)")
+	mode := fs.String("mode", "malware", "analysis lens for --agent runs: 'malware' (MAR) or 'vuln' (VRR)")
+	model := fs.String("model", "", "model id for --agent runs (default: your configured default model)")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), `Usage: binny mcp --project <id> [flags]
 
@@ -59,11 +62,15 @@ and its model drives the tools; diagnostics go to stderr, never stdout.
 
   binny mcp --project <id> --sample ./malware.bin
                                        also serve the sandbox + decompile tools
+  binny mcp --project <id> --agent     also serve the whole-investigation tool
 
 Backend projects need 'openbin login'. Local projects come from 'binny'/'binny
 desktop' '/decompile' and are read from disk. The sandbox and decompile_sample
 tools need Docker on this host and a --sample path (the raw file); without
-either, only the read tools are served.
+either, only the read tools are served. --agent adds an 'investigate' tool that
+runs BINNY's own triage→investigate→report loop and needs a configured LLM
+provider (BYOK) — the host's model drives the read/sandbox tools; --agent lets
+BINNY drive itself and hand back a finished report.
 
 Register it on a Hermes profile as a stdio MCP server, e.g.:
   command: binny
@@ -151,6 +158,43 @@ Flags:
 			})
 		}
 		fmt.Fprintf(os.Stderr, "binny mcp: Docker tools enabled (sample %s)\n", sample)
+	}
+
+	// Phase 3: the whole-investigation tool. Needs a provider (BYOK) because it
+	// runs BINNY's own loop, not the host's model. Registered only on --agent.
+	if *agentTool {
+		// Resolve the provider the way NewSession does: configured default, else
+		// the first one present.
+		prov := cfg.Find(cfg.DefaultProvider)
+		if prov == nil && len(cfg.Providers) > 0 {
+			prov = &cfg.Providers[0]
+		}
+		if prov == nil {
+			return fmt.Errorf("--agent needs a configured LLM provider; run 'binny' once to set one up, or drop --agent")
+		}
+		am := app.ModeMalware
+		if strings.EqualFold(*mode, "vuln") || strings.EqualFold(*mode, "vuln_research") {
+			am = app.ModeVuln
+		}
+		chosenModel := cfg.DefaultModel
+		if m := strings.TrimSpace(*model); m != "" {
+			chosenModel = m
+		}
+		tmpl := &app.Session{
+			Endpoints:     ep,
+			Config:        cfg,
+			API:           client,
+			Project:       proj,
+			SamplePath:    sample,
+			WorkspacePath: strings.TrimSpace(*workspacePath),
+			Mode:          am,
+			Provider:      prov,
+			Model:         chosenModel,
+		}
+		agent.RegisterInvestigateTool(reg, tmpl, client, func(s string) {
+			fmt.Fprintln(os.Stderr, "binny investigate: "+s)
+		})
+		fmt.Fprintf(os.Stderr, "binny mcp: investigate tool enabled (mode=%s, model=%s)\n", am, chosenModel)
 	}
 
 	srv := mcp.NewServer(reg, version)
