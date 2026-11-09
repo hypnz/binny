@@ -88,6 +88,94 @@ async function createWindow() {
   win.on('closed', () => { win = null; });
 }
 
+// --- bighelp mobile gateway control (backend at /api/bighelp/*) ---
+
+function apiRequest(method, path, body) {
+  return new Promise((resolve, reject) => {
+    const data = body ? Buffer.from(JSON.stringify(body)) : null;
+    const req = http.request(
+      { host: '127.0.0.1', port, path, method, headers: { 'Content-Type': 'application/json', ...(data ? { 'Content-Length': data.length } : {}) }, timeout: 8000 },
+      (res) => {
+        let buf = '';
+        res.on('data', (c) => (buf += c));
+        res.on('end', () => {
+          try { resolve({ status: res.statusCode, json: buf ? JSON.parse(buf) : null }); }
+          catch (_) { resolve({ status: res.statusCode, json: null }); }
+        });
+      }
+    );
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+let connectWin = null;
+function openConnectWindow() {
+  if (connectWin && !connectWin.isDestroyed()) { connectWin.focus(); connectWin.reload(); return; }
+  connectWin = new BrowserWindow({
+    width: 440, height: 680, title: 'Connect your phone', backgroundColor: '#0d0f14',
+    parent: win || undefined, webPreferences: { contextIsolation: true },
+  });
+  connectWin.setMenuBarVisibility(false);
+  connectWin.loadURL(`http://127.0.0.1:${port}/api/bighelp/connect`);
+  connectWin.on('closed', () => { connectWin = null; });
+}
+
+async function startSharing() {
+  try {
+    const st = await apiRequest('GET', '/api/bighelp/status');
+    if (st.json && st.json.available === false) {
+      dialog.showErrorBox('BINNY Mobile', 'Mobile sharing is unavailable: ' + (st.json.reason || 'unknown'));
+      return;
+    }
+    // Share whatever project Desktop currently has open. The user can refine
+    // selection from the connection page; this makes the common case one click.
+    const proj = await currentProjectRef();
+    if (!proj) {
+      dialog.showMessageBox(win, { type: 'info', title: 'BINNY Mobile',
+        message: 'Open or decompile a project first, then start mobile sharing.' });
+      return;
+    }
+    const resp = await apiRequest('POST', '/api/bighelp/start', {
+      addr: '0.0.0.0:8787',
+      projects: [{ ref: proj.ref, mode: 'malware', sample: '' }],
+    });
+    if (resp.status !== 200) {
+      dialog.showErrorBox('BINNY Mobile', 'Could not start sharing: ' + ((resp.json && resp.json.error) || resp.status));
+      return;
+    }
+    openConnectWindow();
+    buildMenu();
+  } catch (e) {
+    dialog.showErrorBox('BINNY Mobile', 'Could not start sharing: ' + e.message);
+  }
+}
+
+async function stopSharing() {
+  try { await apiRequest('POST', '/api/bighelp/stop'); } catch (_) {}
+  if (connectWin && !connectWin.isDestroyed()) connectWin.close();
+  buildMenu();
+}
+
+async function sharingRunning() {
+  try {
+    const st = await apiRequest('GET', '/api/bighelp/status');
+    return !!(st.json && st.json.status && st.json.status.running);
+  } catch (_) { return false; }
+}
+
+// currentProjectRef asks the backend what project is open (id or local tree).
+async function currentProjectRef() {
+  try {
+    const cfgResp = await apiRequest('GET', '/api/config');
+    const pid = cfgResp.json && cfgResp.json.projectId;
+    if (pid) return { ref: pid };
+  } catch (_) {}
+  return null;
+}
+
 async function openFolder() {
   const r = await dialog.showOpenDialog(win, {
     title: 'Open a decompiled tree',
@@ -103,8 +191,9 @@ async function openFolder() {
   }
 }
 
-function buildMenu() {
+async function buildMenu() {
   const isMac = process.platform === 'darwin';
+  const running = await sharingRunning();
   const template = [
     ...(isMac ? [{ role: 'appMenu' }] : []),
     {
@@ -118,6 +207,17 @@ function buildMenu() {
     },
     { role: 'editMenu' },
     { role: 'viewMenu' },
+    {
+      label: 'Mobile',
+      submenu: [
+        { label: 'Start Sharing to Phone…', enabled: !running, click: startSharing },
+        { label: 'Stop Sharing', enabled: running, click: stopSharing },
+        { type: 'separator' },
+        { label: 'Show Connection…', enabled: running, click: openConnectWindow },
+        { type: 'separator' },
+        { label: 'About bighelp Sharing', click: () => shell.openExternal('https://github.com/promptclickrun/bighelp') },
+      ],
+    },
     {
       role: 'help',
       submenu: [{ label: 'BINNY on GitHub', click: () => shell.openExternal('https://github.com/openbin-ai/binny') }],
@@ -140,5 +240,10 @@ app.whenReady().then(async () => {
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 
-app.on('before-quit', () => { app.isQuitting = true; if (sidecar) { try { sidecar.kill(); } catch (_) {} } });
+app.on('before-quit', () => {
+  app.isQuitting = true;
+  // Best-effort: stop mobile sharing so the port is freed with the app.
+  apiRequest('POST', '/api/bighelp/stop').catch(() => {});
+  if (sidecar) { try { sidecar.kill(); } catch (_) {} }
+});
 app.on('window-all-closed', () => { app.quit(); });

@@ -4,8 +4,8 @@ package main
 //
 // binny is already an agent harness; this stands up the Hermes-native transport
 // bighelp speaks (HTTP bootstrap + /api/ws JSON-RPC) and backs each chat session
-// with a real binny Engine. The phone connects to this host over the LAN or
-// Tailscale, picks a profile (one per project+mode), and chats with binny.
+// with a real binny Engine. The CLI is the headless way to run it; Binny Desktop
+// drives the same gateway from its menus (see internal/serve /api/bighelp/*).
 
 import (
 	"context"
@@ -18,18 +18,18 @@ import (
 	"strings"
 	"time"
 
-	"openbin.ai/binny/internal/agent"
 	"openbin.ai/binny/internal/api"
 	"openbin.ai/binny/internal/app"
 	"openbin.ai/binny/internal/auth"
 	"openbin.ai/binny/internal/config"
 	"openbin.ai/binny/internal/gateway"
+	"openbin.ai/binny/internal/gwhost"
 )
 
 func runBighelp(args []string) error {
 	fs := flag.NewFlagSet("binny bighelp", flag.ContinueOnError)
 	addr := fs.String("addr", ":8787", "listen address for the gateway (host:port)")
-	project := fs.String("project", "", "project to serve as a profile: a backend id, local:<sha>, or a local decompile sha (repeatable via comma)")
+	project := fs.String("project", "", "project(s) to serve as profiles: backend id, local:<sha>, or a local sha (comma-separated)")
 	mode := fs.String("mode", "malware", "analysis lens for the profile(s): malware or vuln")
 	sample := fs.String("sample", "", "raw sample path, enabling the sandbox/decompile tools for the profile")
 	token := fs.String("token", "", "fixed session token (default: a random one, printed on start)")
@@ -39,14 +39,11 @@ func runBighelp(args []string) error {
 Serves binny to the bighelp app over the Hermes-native transport (no Hermes
 needed). Point the phone's "Add a computer" at this host's address; it connects
 ungated, lists the profile(s) below, and chats with binny backed by a real
-engine.
+engine. Binny Desktop can start/stop this from its Mobile menu instead.
 
   binny bighelp --project local:<sha>            serve one project as a profile
   binny bighelp --project a,b --mode vuln        several projects, vuln lens
   binny bighelp --addr 0.0.0.0:8787              bind all interfaces (Tailscale)
-
-Over Tailscale, run this on your analysis box and add its tailnet address on the
-phone. Needs a configured LLM provider (BYOK) just like 'binny'.
 
 Flags:
 `)
@@ -79,48 +76,33 @@ Flags:
 		am = app.ModeVuln
 	}
 
-	// Build one profile per project id.
-	var profiles []gateway.Profile
-	ids := splitCSV(*project)
-	for i, id := range ids {
-		proj, err := resolveProject(client, id)
-		if err != nil {
-			return err
-		}
-		profiles = append(profiles, gateway.Profile{
-			Name:      profileName(proj.Name, i),
-			Display:   proj.Name,
-			IsDefault: i == 0,
-			Mode:      am,
-			ProjectID: proj.ID,
-			ProjectNm: proj.Name,
-		})
+	var specs []gwhost.ProfileSpec
+	for _, ref := range splitCSV(*project) {
+		specs = append(specs, gwhost.ProfileSpec{ProjectRef: ref, Mode: am, Sample: strings.TrimSpace(*sample)})
 	}
 
-	host := &bighelpHost{
-		ep: ep, cfg: cfg, client: client,
-		sample: strings.TrimSpace(*sample),
-		projByProfile: indexProjects(profiles),
-	}
-
-	factory, sessReg := gateway.NewHostHandlerFactory(host)
-	srv := gateway.NewServer(version, strings.TrimSpace(*token), factory, sessReg)
-
-	ln, err := net.Listen("tcp", *addr)
+	gcfg := gwhost.Config{Endpoints: ep, Cfg: cfg, Client: client, Version: version}
+	host, err := gwhost.BuildHost(gcfg, specs)
 	if err != nil {
-		return fmt.Errorf("listen %s: %w", *addr, err)
+		return err
 	}
-	httpSrv := &http.Server{Handler: srv.Routes()}
+	factory, reg := gateway.NewHostHandlerFactory(host)
+	srv := gateway.NewServer(version, strings.TrimSpace(*token), factory, reg)
 
+	httpSrv := &http.Server{Handler: srv.Routes()}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	fmt.Fprintf(os.Stderr, "binny bighelp: serving %d profile(s) on %s\n", len(profiles), ln.Addr())
-	for _, p := range profiles {
+	ln, err := listen(*addr)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "binny bighelp: serving %d profile(s) on %s\n", len(host.Profiles()), ln.Addr())
+	for _, p := range host.Profiles() {
 		fmt.Fprintf(os.Stderr, "  profile %q → %s (%s)\n", p.Name, p.ProjectNm, p.Mode)
 	}
 	fmt.Fprintf(os.Stderr, "binny bighelp: session token: %s\n", srv.Token())
-	fmt.Fprintf(os.Stderr, "binny bighelp: on the phone, add this computer at http://<this-host>:%s\n", portOf(ln.Addr().String()))
+	fmt.Fprintf(os.Stderr, "binny bighelp: add this computer on the phone at http://<this-host>:%s\n", portOf(ln.Addr().String()))
 
 	go func() {
 		<-ctx.Done()
@@ -134,67 +116,6 @@ Flags:
 	return nil
 }
 
-// bighelpHost implements gateway.Host: it maps a profile to a binny project and
-// builds an engine-backed runtime per session.
-type bighelpHost struct {
-	ep            config.Endpoints
-	cfg           *config.Config
-	client        *api.Client
-	sample        string
-	projByProfile map[string]gateway.Profile
-}
-
-func (h *bighelpHost) Profiles() []gateway.Profile {
-	out := make([]gateway.Profile, 0, len(h.projByProfile))
-	for _, p := range h.projByProfile {
-		out = append(out, p)
-	}
-	return out
-}
-
-func (h *bighelpHost) NewSessionRuntime(profile gateway.Profile) (gateway.Runtime, error) {
-	proj, err := resolveProject(h.client, profile.ProjectID)
-	if err != nil {
-		return nil, err
-	}
-	// Resolve the provider the way NewSession does.
-	prov := h.cfg.Find(h.cfg.DefaultProvider)
-	if prov == nil && len(h.cfg.Providers) > 0 {
-		prov = &h.cfg.Providers[0]
-	}
-	if prov == nil {
-		return nil, fmt.Errorf("no LLM provider configured (run 'binny' once to set one up)")
-	}
-	sess := &app.Session{
-		Endpoints:  h.ep,
-		Config:     h.cfg,
-		API:        h.client,
-		Project:    proj,
-		Mode:       profile.Mode,
-		Autonomy:   app.Autonomous,
-		Provider:   prov,
-		Model:      h.cfg.DefaultModel,
-		SamplePath: h.sample,
-	}
-	rt, err := agent.NewGatewayRuntime(sess, h.client)
-	if err != nil {
-		return nil, err
-	}
-	return &runtimeAdapter{rt: rt}, nil
-}
-
-// runtimeAdapter bridges agent.GatewayRuntime to gateway.Runtime. The two event
-// callback types are structurally identical; this adapts the one to the other.
-type runtimeAdapter struct{ rt *agent.GatewayRuntime }
-
-func (a *runtimeAdapter) Submit(ctx context.Context, text string, io *gateway.TurnIO) error {
-	return a.rt.Submit(ctx, text, &agent.TurnIO{
-		Emit: func(t string, p any) error { return io.Emit(t, p) },
-		Ask:  func(c context.Context, q string, ch []string) (string, error) { return io.Ask(c, q, ch) },
-	})
-}
-func (a *runtimeAdapter) Close() { a.rt.Close() }
-
 func splitCSV(s string) []string {
 	var out []string
 	for _, part := range strings.Split(s, ",") {
@@ -205,30 +126,15 @@ func splitCSV(s string) []string {
 	return out
 }
 
-func profileName(projName string, i int) string {
-	base := strings.ToLower(strings.TrimSpace(projName))
-	base = strings.Map(func(r rune) rune {
-		switch {
-		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
-			return r
-		case r == ' ', r == '-', r == '_', r == '.':
-			return '-'
-		default:
-			return -1
-		}
-	}, base)
-	if base == "" {
-		base = fmt.Sprintf("profile-%d", i+1)
+func listen(addr string) (net.Listener, error) {
+	if strings.TrimSpace(addr) == "" {
+		addr = ":8787"
 	}
-	return base
-}
-
-func indexProjects(ps []gateway.Profile) map[string]gateway.Profile {
-	m := make(map[string]gateway.Profile, len(ps))
-	for _, p := range ps {
-		m[p.Name] = p
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("listen %s: %w", addr, err)
 	}
-	return m
+	return ln, nil
 }
 
 func portOf(addr string) string {

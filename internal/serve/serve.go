@@ -40,6 +40,7 @@ import (
 
 	"openbin.ai/binny/internal/api"
 	"openbin.ai/binny/internal/config"
+	"openbin.ai/binny/internal/gwhost"
 	"openbin.ai/binny/internal/llm"
 	"openbin.ai/binny/internal/tools"
 )
@@ -54,6 +55,7 @@ type Options struct {
 	Dir       string            // decompiled tree to serve (optional)
 	Providers []config.Provider // configured providers, for chat with cloud models
 	Endpoints config.Endpoints  // backend + Keycloak URLs for connected mode
+	Config    *config.Config    // full config, for the bighelp gateway (providers/model)
 	OnListen  func(url string)  // called once the server is bound (the real port when Addr ends in :0)
 }
 
@@ -120,6 +122,10 @@ type server struct {
 
 	// newClient overrides authClient (tests point it at a fake backend).
 	newClient func() (*api.Client, error)
+
+	// bighelp is the mobile gateway controller (lazily created on first use).
+	bighelpOnce sync.Once
+	bighelp     *gwhost.Controller
 }
 
 // dir returns the tree currently being served (initially --serve-dir, later
@@ -224,6 +230,12 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/api/report/save", s.handleSaveReport)
 	mux.HandleFunc("/api/bin/analysis", s.handleBinAnalysis)
 	mux.HandleFunc("/api/bin/function", s.handleBinFunction)
+
+	// bighelp mobile gateway control (Desktop drives this from its Mobile menu).
+	mux.HandleFunc("/api/bighelp/status", s.handleBighelpStatus)
+	mux.HandleFunc("/api/bighelp/start", s.handleBighelpStart)
+	mux.HandleFunc("/api/bighelp/stop", s.handleBighelpStop)
+	mux.HandleFunc("/api/bighelp/connect", s.handleBighelpConnect)
 	return withLocalCORS(mux)
 }
 
@@ -248,7 +260,11 @@ func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	for _, p := range s.opts.Providers {
 		out = append(out, prov{ID: p.ID, Kind: string(p.Kind), Models: p.Models, Ready: p.HasKey()})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"providers": out})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"providers":   out,
+		"projectId":   s.projectID(),
+		"projectName": s.projectName(),
+	})
 }
 
 func (s *server) handleLocalModels(w http.ResponseWriter, r *http.Request) {

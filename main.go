@@ -89,6 +89,7 @@ func run() error {
 			Version:   version,
 			Dir:       *serveDir,
 			Providers: cfg.Providers,
+			Config:    cfg,
 			Endpoints: config.LoadEndpoints(),
 		})
 	}
@@ -160,6 +161,7 @@ OpenAPK account. Same engine and models as the terminal UI. Ctrl+C stops it.
 		Version:   version,
 		Dir:       *dir,
 		Providers: cfg.Providers,
+		Config:    cfg,
 		Endpoints: config.LoadEndpoints(),
 		OnListen: func(url string) {
 			fmt.Fprintf(os.Stderr, "\nBINNY Desktop is running at %s  (Ctrl+C to stop)\n", url)
