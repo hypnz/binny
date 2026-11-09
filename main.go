@@ -45,6 +45,8 @@ func usage() {
   binny                 the terminal UI (pick a project, set a key, go)
   binny desktop         BINNY Desktop: the same engine with a graphical UI,
                         opened in your browser (binny desktop -h for options)
+  binny mcp             serve BINNY's tools over MCP (stdio) for an MCP host
+                        such as a Hermes computer (binny mcp -h for options)
 
 Flags:
 `)
@@ -52,10 +54,14 @@ Flags:
 }
 
 func run() error {
-	// `binny desktop` is a subcommand, not a flag, so it's read before the
-	// flag set is parsed (and so `binny desktop -h` prints its own help).
+	// `binny desktop` and `binny mcp` are subcommands, not flags, so they're
+	// read before the flag set is parsed (and so `binny <sub> -h` prints its
+	// own help).
 	if len(os.Args) > 1 && os.Args[1] == "desktop" {
 		return runDesktop(os.Args[2:])
+	}
+	if len(os.Args) > 1 && os.Args[1] == "mcp" {
+		return runMCP(os.Args[2:])
 	}
 	flag.Usage = usage
 	// --sample points BINNY at the raw sample on disk for active extraction.
